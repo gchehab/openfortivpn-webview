@@ -1,0 +1,7 @@
+selenium~=2.1
+webdriver-manager
+pyotp
+cryptography
+configparser
+pyssl
+python-daemon
