@@ -5,12 +5,15 @@ The application will simply open the SAML page to let you sign in.
 As soon as the `SVPNCOOKIE` is set, the application will print it to
 stdout and exit.
 
-The application comes in two flavors:
+The application comes in three flavors:
  - [openfortivpn-webview-qt](openfortivpn-webview-qt/)
  - [openfortivpn-webview-electron](openfortivpn-webview-electron/)
+ - openfortivpn-auth, python command-line daemon
 
-They should be equivalent, but `openfortivpn-webview-qt` may have
-some issues with some SAML providers.
+The first two should be equivalent, but `openfortivpn-webview-qt` may have
+some issues with some SAML providers. The third was tested only with Microsoft SAML provider,
+it should read the gateway, user and password data from the /etc/openfortivpn/config file, and 
+the OTP secret from the /etc/openfortivpn/secret file. 
 
 
 ## Usage
