@@ -1,4 +1,4 @@
-#!/usr/bin/sudo ./env/bin/python3
+#!/usr/local/bin/env/bin/python3
 
 from weakref import proxy
 import requests
@@ -8,11 +8,13 @@ import time
 import datetime as dt
 import random
 import os
+import signal
 import ssl
 from cryptography import x509;
 from cryptography.hazmat.primitives import hashes 
 import configparser
 import daemon
+import syslog
 
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -44,18 +46,18 @@ import pyotp
 import atexit
 
 DEBUG=False
-RETRIES=20
+MAX_STEPS=20
 SCHEDULE_MODE=True
 IPTABLES_MODE=False if not SCHEDULE_MODE else True
 
 PROXY = getattr(os.environ, 'https_proxy', None)
   
 WORKING_HOURS = {
-  'start': dt.time(7,15),
-  'end': dt.time(15,0) if not DEBUG else dt.time(23,59),
+  'start': dt.time(7,25),
+  'end': dt.time(17,0), #if not DEBUG else dt.time(23,59),
   'randomness': 15*60,
   'weekdays': range(1,5)
-} if not SCHEDULE_MODE else {
+} if SCHEDULE_MODE else {
   'start': dt.time(0,0),
   'end': dt.time(0,0),
   'randomness': 0,
@@ -108,7 +110,7 @@ class CustomHttpClient(HttpClient):
       return requests.get(url, params, proxies=proxies,  **kwargs)
 
 
-class Login():
+class VPN():
   def __init__(self, host, port, user, pwd, secret, cert, realm):
     self.host = host
     self.port = port
@@ -131,14 +133,14 @@ class Login():
       """)
       delay(2, randomize=False)
 
-  def setup_method(self, method, driver='phantomjs'):
+  def setup_method(self, driver='phantomjs'):
 
     self.driver = None
 
     if driver=='phantomjs':
       self.driver = webdriver.PhantomJS(
         executable_path='/opt/phantomjs/bin/phantomjs',
-        service_args=['--remote-debugger-port=9001','--remote-debugger-autorun=yes']) if DEBUG else []
+        service_args=['--remote-debugger-port=9001','--remote-debugger-autorun=yes'] if DEBUG else [])
     else:
       chrome_options = webdriver.ChromeOptions()
       chrome_options.add_argument('--headless')
@@ -162,7 +164,11 @@ class Login():
     delay (1, randomize=False)
 
   
-  def teardown_method(self, method):
+  def teardown_method(self):
+    self.driver.close()
+    self.driver.service.process.send_signal(signal.SIGTERM) # kill the specific phantomjs child proc
+    delay (3)
+    self.driver.service.process.send_signal(signal.SIGKILL) # kill the specific phantomjs child proc
     self.driver.quit()
 
   def find_elements(self, selectors=None):
@@ -220,10 +226,13 @@ class Login():
     actions.click(on_element=element)
     
   def login(self):
-    SVPNCOOKIE=self.driver.get_cookie('SVPNCOOKIE')
-    if SVPNCOOKIE: 
-      if DEBUG: print('got svncookie')
-      return SVPNCOOKIE.get('value',None)     
+    try:
+      SVPNCOOKIE=self.driver.get_cookie('SVPNCOOKIE')
+      if SVPNCOOKIE: 
+        if DEBUG: print('got svncookie')
+        return SVPNCOOKIE.get('value',None)     
+    except Exception:
+      pass
 
     selectors = {
       '#otherTile': False,
@@ -233,18 +242,19 @@ class Login():
       'input[type=submit]': False
     }
 
-    tries=0
+    steps=0
         
-    while SVPNCOOKIE is None and tries < RETRIES:
-      tries += 1
-      if DEBUG: print('Try:', tries,'/', RETRIES)
+    while SVPNCOOKIE is None and steps < MAX_STEPS:
+      steps += 1
+      if DEBUG: 
+        print('Try:', steps,'/', MAX_STEPS)
       
-      print (self.driver.title, end='') 
-      try:
-        print (': ' + list(self.find_elements(['.title','.text-title']).values())[-1][-1].text)
-      except Exception as e:
-        print()
-        pass
+        print (self.driver.title, end='') 
+        try:
+          print (': ' + list(self.find_elements(['.title','.text-title']).values())[-1][-1].text)
+        except Exception as e:
+          print()
+          pass
       
       res = self.find_elements(
         selectors=selectors.keys()
@@ -296,7 +306,7 @@ class Login():
         delay(1)
 
       alerts = self.find_elements(['.alert'])
-      if alerts:
+      if alerts and DEBUG:
         print(alerts)
                       
       SVPNCOOKIE=self.driver.get_cookie('SVPNCOOKIE')
@@ -304,7 +314,7 @@ class Login():
         if DEBUG: print('got svncookie')
         break
     
-    if tries >= RETRIES:
+    if steps >= MAX_STEPS:
       if DEBUG: raise Exception('Failed to get cookie')
       pass
 
@@ -321,13 +331,16 @@ class Login():
         for line in iter(out.readline, b''):
           queue.put(line)
         out.close()
+        delay(1)
       except Exception as e:
         pass
 
     # call openfortivpn
-    if DEBUG: print('openfortivpn')
+    if DEBUG: 
+      print('Openfortivpn connecting')
+    else:
+      syslog.syslog(syslog.LOG_NOTICE,'Openfortivpn connecting')
     cmd = [
-        '/usr/bin/sudo',
         '/usr/local/bin/openfortivpn',
         "-c", "/etc/openfortivpn/config",
         '--cookie=' + cookie,
@@ -336,16 +349,17 @@ class Login():
     cmd += ['--trusted-cert=' + self.cert] if self.cert is not None else []
       
     p = subprocess.Popen(
-      ' '.join(cmd),
+      cmd,
       stdout=subprocess.PIPE, 
       stderr=subprocess.PIPE,
-      close_fds=ON_POSIX,
-      shell=True)
+      close_fds=ON_POSIX)
     
     q=Queue()
     t=Thread(target=enqueue_output, args=(p.stdout, q))
     t.daemon = True
     t.start()
+
+    #iptables_set()
 
     while p.poll() is None:
       try:
@@ -357,8 +371,17 @@ class Login():
 
       if not should_be_on():
         p.terminate()
+        delay(3, randomize=False)
+        p.kill()
+        delay(3, randomize=False)    
+        break
+
+      delay(1)
 
     stdout, stderr = p.communicate()
+
+    t.stop()
+
     if (p.returncode == 1):
       if '--trusted-cert' in stdout.decode('utf8'):
         self.cert = [ l.strip().split(' ') for l in stdout.decode('utf8').split() if '--trusted-cert' in l]
@@ -366,10 +389,22 @@ class Login():
         print (stdout,stderr)
         return False
     return True
+
+def iptables_set():
+  try:
+    p=subprocess.run('/usr/sbin/iptables -t nat -C POSTROUTING -d 172.16.0.0/12 -j MASQUERADE'.split(' '))
+    if p.returncode != 0:
+      if DEBUG: print('Creating iptables nat rule')
+      p=subprocess.run('/usr/sbin/iptables -t nat -A POSTROUTING -d 172.16.0.0/12 -j MASQUERADE'.split(' '))
+  except Exception:
+    pass
   
 def main():
   if DEBUG: print ('Number of arguments:', len(sys.argv), 'arguments.')
   if DEBUG: print ('Argument List:', str(sys.argv))
+
+  iptables_set()
+
   if (len (sys.argv) == 1):
     sys.argv.append('yyyyy')
     sys.argv.append('xxxxx')
@@ -392,32 +427,56 @@ def main():
   if DEBUG: print ('Connecting to:',config['host'], config['port'], config['username'])
 
   cookie_is_valid = False if os.environ.get('SVPNCOOKIE',None) is None else True
-  ts = Login( config['host'], config['port'], config['username'], config['password'], secret, config['trusted-cert'], config['realm'])
-  ts.setup_method(None)
-      
+  ts = VPN( config['host'], config['port'], config['username'], config['password'], secret, config['trusted-cert'], config['realm'])
+  
   off_warn = False
   while True:
-    if should_be_on():
-      if off_warn and DEBUG: print ('in working hours, connecting')
-      if os.environ.get('SVPNCOOKIE',None) is None or not cookie_is_valid:
-        SVPNCOOKIE = ts.login()
-        os.environ['SVPNCOOKIE']=SVPNCOOKIE
-        if DEBUG: print('VPN logged in. Cookie:', SVPNCOOKIE)
+    try:
+      if should_be_on():
+        if off_warn: 
+          if not DEBUG: 
+            syslog.syslog(syslog.LOG_NOTICE,'In working hours, will connect')
+          else: 
+            print ('in working hours, connecting')
+        if os.environ.get('SVPNCOOKIE',None) is None or not cookie_is_valid:
+          syslog.syslog(syslog.LOG_NOTICE,'Getting new VPN cookie')
+          ts.setup_method()
+          SVPNCOOKIE = ts.login()
+          ts.teardown_method()
+          os.environ['SVPNCOOKIE']=SVPNCOOKIE
+          if DEBUG: 
+            print('VPN logged in. Cookie:', SVPNCOOKIE) 
+          else:
+            syslog.syslog(syslog.LOG_DEBUG,'Got a cookie')
+
+        else:
+          if not DEBUG: syslog.syslog(syslog.LOG_DEBUG,'Getting cookie from previous run')
+          SVPNCOOKIE = os.environ['SVPNCOOKIE']
+          if DEBUG: print('VPN logged in. Cookie:', SVPNCOOKIE)
+        cookie_is_valid = ts.openvpn(SVPNCOOKIE)
+        off_warn=False
       else:
-        SVPNCOOKIE = os.environ['SVPNCOOKIE']
-        if DEBUG: print('VPN logged in. Cookie:', SVPNCOOKIE)
-      cookie_is_valid = ts.openvpn(SVPNCOOKIE)
-      off_warn=False
-    else:
-      if not off_warn and DEBUG: print ('not in working hours')
-      off_warn=True
+        if not off_warn:
+          if not DEBUG: 
+            syslog.syslog(syslog.LOG_NOTICE,'Not in working hours, will not connect')
+          else:
+            print ('not in working hours')
+        off_warn=True
+    except Exception as e:
+      pass
     delay(15)
 
 
 if __name__ == '__main__':
 
-  if not DEBUG:
-    with daemon.DaemonContext():
-      main()
-  else:
+  # if not DEBUG:
+  #   syslog.syslog(syslog.LOG_INFO,'Starting openfortivpn-auth daemon')
+  #   pidfile = "/run/openfortivpn-auth.pid"
+  #   with daemon.DaemonContext(pidfile=pidfile):
+  #     while True: delay(1)
+  #     syslog.syslog(syslog.LOG_INFO,'Starting openfortivpn-auth daemon')
+  #     main()
+  # else:
     main()
+
+  # exit(0) 
