@@ -5,3 +5,4 @@ cryptography
 configparser
 pyssl
 python-daemon
+#setproctitle
